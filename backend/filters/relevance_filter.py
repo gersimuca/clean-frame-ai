@@ -1,23 +1,36 @@
+import io
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
-from pathlib import Path
 
 
 class RelevanceFilter:
-    """Zero-shot classification with CLIP."""
+    """Stage 2: Zero-shot classification with CLIP."""
 
     def __init__(self, device: str = "cuda"):
         self.device = device
-        print("Loading CLIP ViT-B/32...")
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        print("Loading CLIP ViT-B/32 for relevance scoring...")
+
+        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        try:
+            self.model = self.model.to(self.device)
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "nvidia driver" in err_msg or "cuda" in err_msg or "gpu" in err_msg:
+                print(f"[!] GPU driver mismatch for CLIP. Falling back to CPU.")
+                self.device = "cpu"
+                self.model = self.model.to("cpu")
+            else:
+                raise
+
         self.model.eval()
 
     @torch.no_grad()
-    def check(self, filepath: Path, dog_prompts, not_dog_prompts, threshold: float = 0.30):
+    def check_bytes(self, image_bytes: bytes, dog_prompts, not_dog_prompts, threshold: float = 0.30):
         try:
-            image = Image.open(filepath).convert("RGB")
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             return False, 0.0, f"open_error_{e}"
 

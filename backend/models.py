@@ -1,22 +1,22 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
 class PipelineConfig(BaseModel):
-    input_dir: str
-    output_dir: str = "./cleaned_dataset"
-    rejected_dir: str = "./rejected_dataset"
-    relevance_threshold: float = 0.30
-    dog_confidence: float = 0.65
-    min_box_ratio: float = 0.03
-    max_box_ratio: float = 0.95
-    min_image_size: int = 50
-    num_workers: int = 4
-    device: str = "cuda"
-    corrupt_enabled: bool = True
-    relevance_enabled: bool = True
-    framing_enabled: bool = True
+    model_config = ConfigDict(populate_by_name=True)
+
+    input_dir: Optional[str] = Field(default=None, alias="inputDir")
+    relevance_threshold: float = Field(default=0.30, alias="relevanceThreshold")
+    dog_confidence: float = Field(default=0.65, alias="dogConfidence")
+    min_box_ratio: float = Field(default=0.03, alias="minBoxRatio")
+    max_box_ratio: float = Field(default=0.95, alias="maxBoxRatio")
+    min_image_size: int = Field(default=50, alias="minImageSize")
+    num_workers: int = Field(default=4, alias="numWorkers")
+    device: str = Field(default="cuda", alias="device")
+    corrupt_enabled: bool = Field(default=True, alias="corruptEnabled")
+    relevance_enabled: bool = Field(default=True, alias="relevanceEnabled")
+    framing_enabled: bool = Field(default=True, alias="framingEnabled")
 
 
 class DetectionBox(BaseModel):
@@ -25,13 +25,13 @@ class DetectionBox(BaseModel):
     x1: float
     y1: float
     x2: float
+    x2: float
     y2: float
 
 
 class ImageRecord(BaseModel):
     id: int
     filename: str
-    filepath: str
     status: str
     file_size_bytes: Optional[int] = None
     width: Optional[int] = None

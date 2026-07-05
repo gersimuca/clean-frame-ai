@@ -1,10 +1,20 @@
-import shutil
 import asyncio
-from pathlib import Path
 from typing import Optional, Callable
+from io import BytesIO
+
+from PIL import Image
+
 from config import settings
 from database import db
 from filters import CorruptFilter, RelevanceFilter, FramingFilter
+
+
+def create_thumbnail(image_bytes: bytes, size: tuple = (256, 256)) -> bytes:
+    img = Image.open(BytesIO(image_bytes))
+    img.thumbnail(size, Image.Resampling.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
 
 
 class Pipeline:
@@ -19,12 +29,6 @@ class Pipeline:
             "relevance": RelevanceFilter(device=settings.device),
             "framing": FramingFilter(device=settings.device),
         }
-
-    def _ensure_dirs(self):
-        settings.output_dir.mkdir(parents=True, exist_ok=True)
-        settings.rejected_dir.mkdir(parents=True, exist_ok=True)
-        for sub in ("corrupt", "irrelevant", "bad_framing", "other"):
-            (settings.rejected_dir / sub).mkdir(parents=True, exist_ok=True)
 
     def _emit(self, stage: str, progress: float, stats: dict, message: str = "", level: str = "info"):
         self.current_stage = stage
@@ -42,7 +46,6 @@ class Pipeline:
     async def run(self, config_override: Optional[dict] = None):
         self.running = True
         self.cancelled = False
-        self._ensure_dirs()
 
         cfg = {
             "corrupt_enabled": config_override.get("corrupt_enabled", settings.corrupt_enabled),
@@ -58,6 +61,7 @@ class Pipeline:
         pending = db.get_pending()
         total = len(pending)
         if total == 0:
+            self._emit("Complete", 100.0, db.get_stats(), "No pending images", "info")
             self.running = False
             return
 
@@ -87,58 +91,46 @@ class Pipeline:
         self.running = False
 
     async def _process_single(self, record: dict, cfg: dict) -> bool:
-        filepath = Path(record["filepath"])
         image_id = record["id"]
+        image_bytes = db.get_image_data(image_id)
 
-        # Stage 1: Corrupt
+        if image_bytes is None:
+            db.update_status(image_id, "error", corrupt_reason="image_data_missing")
+            return False
+
         if cfg["corrupt_enabled"]:
-            ok, score, reason = self.filters["corrupt"].check(filepath, min_size=cfg["min_image_size"])
+            ok, score, reason = self.filters["corrupt"].check_bytes(image_bytes, min_size=cfg["min_image_size"])
             if not ok:
-                self._reject(image_id, filepath, "corrupt", corrupt_pass=False, corrupt_reason=reason)
+                db.update_status(image_id, "rejected", corrupt_pass=False, corrupt_reason=reason)
                 return False
 
-        # Stage 2: Relevance
         if cfg["relevance_enabled"]:
-            ok, score, reason = self.filters["relevance"].check(
-                filepath,
+            ok, score, reason = self.filters["relevance"].check_bytes(
+                image_bytes,
                 settings.dog_prompts,
                 settings.not_dog_prompts,
                 cfg["relevance_threshold"],
             )
             if not ok:
-                self._reject(image_id, filepath, "irrelevant", relevance_score=score, relevance_reason=reason)
+                db.update_status(image_id, "rejected", relevance_score=score, relevance_reason=reason)
                 return False
 
-        # Stage 3: Framing
         if cfg["framing_enabled"]:
-            ok, score, reason, detections = self.filters["framing"].check(
-                filepath,
+            ok, score, reason, detections = self.filters["framing"].check_bytes(
+                image_bytes,
                 confidence=cfg["dog_confidence"],
                 min_box_ratio=cfg["min_box_ratio"],
                 max_box_ratio=cfg["max_box_ratio"],
             )
             if not ok:
-                self._reject(image_id, filepath, "bad_framing", framing_score=score, framing_reason=reason, detections=detections)
+                db.update_status(image_id, "rejected", framing_score=score, framing_reason=reason,
+                                 detections=detections)
                 return False
             db.update_status(image_id, "accepted", detections=detections, framing_score=score)
         else:
             db.update_status(image_id, "accepted")
 
-        # Copy to output
-        dest = settings.output_dir / filepath.name
-        if dest.exists():
-            dest = dest.with_stem(f"{dest.stem}_{filepath.stat().st_mtime}")
-        shutil.copy2(filepath, dest)
-        db.update_filepath(image_id, str(dest))
         return True
-
-    def _reject(self, image_id: int, filepath: Path, category: str, **kwargs):
-        dest = settings.rejected_dir / category / filepath.name
-        if dest.exists():
-            dest = dest.with_stem(f"{dest.stem}_{filepath.stat().st_mtime}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(filepath, dest)
-        db.update_status(image_id, "rejected", **kwargs)
 
     def stop(self):
         self.cancelled = True

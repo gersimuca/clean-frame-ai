@@ -1,26 +1,40 @@
+import io
 import torch
 import torchvision
 from torchvision import transforms
 from PIL import Image
-from pathlib import Path
 
 
 class FramingFilter:
-    """Object detection for framing."""
+    """Stage 3: Object detection for framing."""
 
     def __init__(self, device: str = "cuda"):
         self.device = device
-        print("Loading Faster R-CNN...")
+        print("Loading Faster R-CNN for framing analysis...")
+
         weights = torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
-        self.model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=weights).to(device)
+        self.model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=weights)
+
+        try:
+            self.model = self.model.to(self.device)
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "nvidia driver" in err_msg or "cuda" in err_msg or "gpu" in err_msg:
+                print(f"[!] GPU driver mismatch for Faster R-CNN. Falling back to CPU.")
+                self.device = "cpu"
+                self.model = self.model.to("cpu")
+            else:
+                raise
+
         self.model.eval()
         self.transform = transforms.Compose([transforms.ToTensor()])
         self.dog_label = 18
 
     @torch.no_grad()
-    def check(self, filepath: Path, confidence: float = 0.65, min_box_ratio: float = 0.03, max_box_ratio: float = 0.95):
+    def check_bytes(self, image_bytes: bytes, confidence: float = 0.65, min_box_ratio: float = 0.03,
+                    max_box_ratio: float = 0.95):
         try:
-            image = Image.open(filepath).convert("RGB")
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             return False, 0.0, f"open_error_{e}", []
 
