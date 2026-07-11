@@ -29,7 +29,7 @@ export default function ImageCard({ image, viewMode, isSelected, onToggle, onCli
           )}
         </div>
         <div className="text-right">
-          {image.score !== undefined && (
+          {typeof image.score === 'number' && (
             <span className={`text-xs font-mono px-2 py-1 rounded ${
               image.score > 0.7 ? 'bg-emerald-100 text-emerald-700' :
               image.score > 0.4 ? 'bg-amber-100 text-amber-700' :
@@ -69,7 +69,7 @@ export default function ImageCard({ image, viewMode, isSelected, onToggle, onCli
       <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
         <div className="absolute bottom-0 left-0 right-0 p-3">
           <p className="text-sm font-medium text-white truncate">{image.filename}</p>
-          {image.score !== undefined && <p className="text-xs text-emerald-300 mt-1">Score: {image.score.toFixed(3)}</p>}
+          {typeof image.score === 'number' && <p className="text-xs text-emerald-300 mt-1">Score: {image.score.toFixed(3)}</p>}
           {image.reason && <p className="text-xs text-red-300 mt-1 truncate">{image.reason}</p>}
         </div>
         <button onClick={(e) => { e.stopPropagation(); onToggle() }} className={`absolute top-3 right-3 w-8 h-8 rounded-full flex items-center justify-center transition-colors ${isSelected ? 'bg-emerald-600 text-white' : 'bg-black/50 text-white hover:bg-black/70'}`}>

@@ -1,19 +1,20 @@
-import os
 import io
+import json
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from PIL import Image
 
 from config import settings
-from database import db
+from database import db, REASON_COLUMNS
 from pipeline import pipeline, create_thumbnail
 from models import PipelineConfig, StatsResponse
+from serializers import format_image_row, format_stats
 
 
 @asynccontextmanager
@@ -73,7 +74,9 @@ async def upload_images(files: list[UploadFile] = File(...)):
 async def upload_from_url(url: str = Form(...)):
     import requests
     try:
-        resp = requests.get(url, timeout=30)
+        # requests.get is blocking I/O; running it directly here would freeze
+        # the whole server (including the SSE stream) for up to 30s.
+        resp = await asyncio.to_thread(requests.get, url, timeout=30)
         resp.raise_for_status()
         contents = resp.content
 
@@ -109,22 +112,68 @@ async def stop_pipeline():
     return {"status": "stopping"}
 
 
+@app.get("/api/pipeline/stream")
+async def pipeline_stream(request: Request):
+    """Server-Sent Events stream of pipeline progress. Replaces the old
+    /ws/pipeline WebSocket, which only supported a single listener at a time
+    and offered no way for a newly-opened tab to learn the current state."""
+    queue = pipeline.subscribe()
+
+    async def event_generator():
+        try:
+            # Send current state immediately so a client that connects mid-run
+            # (or reconnects) doesn't have to wait for the next event.
+            yield _sse_event(pipeline.snapshot())
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield _sse_event(event)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            pipeline.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/api/stats", response_model=StatsResponse)
 async def get_stats():
-    return StatsResponse(**db.get_stats())
+    return StatsResponse(**format_stats(db.get_stats()))
 
 
 @app.get("/api/images")
 async def get_images(status: str, limit: int = 100, offset: int = 0):
     rows = db.get_by_status(status, limit=limit, offset=offset)
-    total = db.get_stats().get("total", 0)
-    return {"images": [_format_image(row) for row in rows], "total": total}
+    total = db.count_by_status(status)
+    return {"images": [format_image_row(row) for row in rows], "total": total}
+
+
+@app.get("/api/images/by-reason/{reason_type}")
+async def get_images_by_reason(reason_type: str, limit: int = 200, offset: int = 0):
+    """Images rejected for a specific reason: corrupt / irrelevant / bad-framing.
+    These are NOT `status` values (status is only pending/accepted/rejected/error),
+    so this is a separate lookup from /api/images?status=..."""
+    if reason_type not in REASON_COLUMNS:
+        raise HTTPException(status_code=400, detail=f"Unknown reason type: {reason_type}")
+    rows = db.get_by_reason(reason_type, limit=limit, offset=offset)
+    total = db.count_by_reason(reason_type)
+    return {"images": [format_image_row(row) for row in rows], "total": total}
 
 
 @app.get("/api/images/invalid")
 async def get_all_invalid():
     rows = db.get_all_invalid()
-    return {"images": [_format_image(row) for row in rows], "total": len(rows)}
+    return {"images": [format_image_row(row) for row in rows], "total": len(rows)}
 
 
 @app.get("/api/images/{image_id}")
@@ -132,7 +181,7 @@ async def get_image(image_id: int):
     row = db.get_by_id(image_id)
     if not row:
         raise HTTPException(status_code=404, detail="Image not found")
-    return _format_image(row, detailed=True)
+    return format_image_row(row, detailed=True)
 
 
 @app.get("/api/images/{image_id}/full")
@@ -182,8 +231,7 @@ async def delete_image(image_id: int):
     row = db.get_by_id(image_id)
     if not row:
         raise HTTPException(status_code=404, detail="Image not found")
-    with db._connect() as conn:
-        conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+    db.delete_image(image_id)
     return {"status": "deleted"}
 
 
@@ -193,53 +241,8 @@ async def clear_all():
     return {"status": "cleared"}
 
 
-@app.websocket("/ws/pipeline")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    async def send_update(data: dict):
-        try:
-            await websocket.send_json(data)
-        except Exception:
-            pass
-
-    pipeline.on_progress = send_update
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-            if not pipeline.running and pipeline.progress >= 100:
-                await asyncio.sleep(2)
-                break
-    except Exception:
-        pass
-    finally:
-        pipeline.on_progress = None
-
-
-def _format_image(row: dict, detailed: bool = False) -> dict:
-    size_str = f"{row['file_size_bytes'] / (1024 * 1024):.1f} MB" if row.get('file_size_bytes') else "—"
-    dim_str = f"{row['width']}x{row['height']}" if row.get('width') else "—"
-
-    result = {
-        "id": row["id"],
-        "filename": row["filename"],
-        "url": f"/api/images/{row['id']}/full",
-        "thumbnailUrl": f"/api/images/{row['id']}/thumb",
-        "status": row["status"],
-        "score": row.get("relevance_score") or row.get("framing_score"),
-        "reason": row.get("corrupt_reason") or row.get("relevance_reason") or row.get("framing_reason"),
-        "fileSize": size_str,
-        "dimensions": dim_str,
-        "width": row.get("width"),
-        "height": row.get("height"),
-        "detections": row.get("detections"),
-    }
-
-    if detailed:
-        result["metadata"] = {k: v for k, v in row.items() if v is not None and k != "image_data"}
-
-    return result
+def _sse_event(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
 
 if __name__ == "__main__":

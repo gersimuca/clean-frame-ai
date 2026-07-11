@@ -66,7 +66,13 @@ class FramingFilter:
             return False, round(best_attempt, 4), f"no_dog_detected(best_conf={best_attempt:.3f})", detections
 
         best_idx = int(dog_scores.argmax())
-        x1, y1, x2, y2 = dog_boxes[best_idx]
+        # Cast off numpy.float32 here. Otherwise every value derived below
+        # (ratio, center_score, composite_score) stays numpy-typed, and
+        # sqlite3 will silently store a numpy scalar as raw BLOB bytes
+        # instead of a REAL number (it satisfies the buffer protocol, so no
+        # error is raised at write time - the corruption only surfaces later
+        # as a crash when something tries to read/serialize that column).
+        x1, y1, x2, y2 = (float(v) for v in dog_boxes[best_idx])
         box_area = (x2 - x1) * (y2 - y1)
         img_area = image.width * image.height
         ratio = box_area / img_area

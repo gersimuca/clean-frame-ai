@@ -10,9 +10,10 @@ import {
 } from 'lucide-react'
 import { usePipeline } from '../context/PipelineContext'
 import ThresholdSlider from './ThresholdSlider'
+import LogViewer from './LogViewer'
 
 export default function PipelineControls() {
-  const { config, updateConfig, startPipeline, stopPipeline, isRunning, stats } = usePipeline()
+  const { config, updateConfig, startPipeline, stopPipeline, isRunning, isStopping, stats } = usePipeline()
   const [showAdvanced, setShowAdvanced] = useState(false)
 
   const handleStart = () => {
@@ -28,9 +29,9 @@ export default function PipelineControls() {
         </div>
         <div className="flex gap-3">
           {isRunning ? (
-            <button onClick={stopPipeline} className="btn-secondary flex items-center gap-2 text-red-600 border-red-200 hover:bg-red-50">
+            <button onClick={stopPipeline} disabled={isStopping} className="btn-secondary flex items-center gap-2 text-red-600 border-red-200 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed">
               <Square className="w-4 h-4" />
-              Stop Pipeline
+              {isStopping ? 'Stopping…' : 'Stop Pipeline'}
             </button>
           ) : (
             <button onClick={handleStart} className="btn-primary flex items-center gap-2">
@@ -134,6 +135,8 @@ export default function PipelineControls() {
           </div>
         </div>
       )}
+
+      <LogViewer />
     </div>
   )
 }

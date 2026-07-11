@@ -10,7 +10,10 @@ export default function LogViewer() {
     const a = document.createElement('a')
     a.href = url
     a.download = `puralens-logs-${new Date().toISOString()}.txt`
+    document.body.appendChild(a)
     a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
   return (
@@ -29,6 +32,9 @@ export default function LogViewer() {
         </div>
       </div>
       <div className="bg-gray-50 rounded-lg p-4 font-mono text-sm h-96 overflow-auto border border-gray-200">
+        {logs.length === 0 && (
+          <p className="text-gray-400 text-center py-8 font-sans">No logs yet — run the pipeline to see activity here.</p>
+        )}
         {logs.map((log, i) => (
           <div key={i} className="py-1 border-b border-gray-200 last:border-0">
             <span className="text-gray-400">[{new Date(log.time).toLocaleTimeString()}]</span>{' '}

@@ -2,23 +2,27 @@ import { createContext, useContext, useState, useCallback, useEffect } from 'rea
 
 const PipelineContext = createContext(null)
 
+const initialStats = {
+  total: 0,
+  pending: 0,
+  accepted: 0,
+  rejected: 0,
+  error: 0,
+  corrupt: 0,
+  irrelevant: 0,
+  badFraming: 0,
+}
+
 export function PipelineProvider({ children }) {
   const [pipelineState, setPipelineState] = useState({
     isRunning: false,
+    isStopping: false,
     progress: 0,
     currentStage: null,
-    stats: {
-      total: 0,
-      pending: 0,
-      accepted: 0,
-      rejected: 0,
-      error: 0,
-      corrupt: 0,
-      irrelevant: 0,
-      badFraming: 0,
-    },
+    rate: 0,
+    etaSeconds: null,
+    stats: initialStats,
     config: {
-      inputDir: '',
       relevanceThreshold: 0.30,
       dogConfidence: 0.65,
       minBoxRatio: 0.03,
@@ -31,65 +35,114 @@ export function PipelineProvider({ children }) {
       framingEnabled: true,
     },
     logs: [],
+    lastResult: null,
     selectedImage: null,
     filter: 'all',
   })
 
-  const [ws, setWs] = useState(null)
-
-  useEffect(() => {
-    fetchStats()
-    const socket = new WebSocket('ws://localhost:8000/ws/pipeline')
-
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-
-      if (data.type === 'progress') {
-        setPipelineState(prev => ({
-          ...prev,
-          progress: data.progress,
-          currentStage: data.stage,
-          stats: { ...prev.stats, ...data.stats },
-        }))
-      } else if (data.type === 'complete') {
-        setPipelineState(prev => ({
-          ...prev,
-          isRunning: false,
-          progress: 100,
-          stats: { ...prev.stats, ...data.stats },
-        }))
-      } else if (data.message) {
-        setPipelineState(prev => ({
-          ...prev,
-          logs: [...prev.logs.slice(-499), {
-            time: new Date().toISOString(),
-            message: data.message || data.stage || 'Update',
-            level: data.level || 'info'
-          }],
-        }))
-      }
-    }
-
-    socket.onclose = () => {
-      console.log('WebSocket disconnected')
-    }
-
-    setWs(socket)
-    return () => socket.close()
+  const appendLog = useCallback((message, level = 'info') => {
+    if (!message) return
+    setPipelineState(prev => ({
+      ...prev,
+      logs: [...prev.logs.slice(-499), {
+        time: new Date().toISOString(),
+        message,
+        level,
+      }],
+    }))
   }, [])
 
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const res = await fetch('/api/stats')
       const data = await res.json()
-      setPipelineState(prev => ({ ...prev, stats: data }))
+      setPipelineState(prev => ({ ...prev, stats: { ...prev.stats, ...data } }))
     } catch (e) {
       console.error('Failed to fetch stats', e)
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    fetchStats()
+
+    // Server-Sent Events stream of pipeline progress (replaces the old
+    // WebSocket, which only ever supported one listener and had no way to
+    // sync up a tab that opened mid-run).
+    const source = new EventSource('/api/pipeline/stream')
+
+    source.onmessage = (event) => {
+      const data = JSON.parse(event.data)
+
+      switch (data.type) {
+        case 'snapshot':
+          // Sent immediately on connect so a fresh/refreshed tab reflects
+          // the true current state instead of assuming "idle".
+          setPipelineState(prev => ({
+            ...prev,
+            isRunning: data.running,
+            progress: data.progress,
+            currentStage: data.stage,
+            stats: { ...prev.stats, ...data.stats },
+          }))
+          break
+
+        case 'progress':
+          setPipelineState(prev => ({
+            ...prev,
+            isRunning: true,
+            progress: data.progress,
+            currentStage: data.stage,
+            rate: data.rate ?? prev.rate,
+            etaSeconds: data.eta_seconds ?? null,
+            stats: { ...prev.stats, ...data.stats },
+          }))
+          appendLog(data.message, data.level)
+          break
+
+        case 'image_result':
+          setPipelineState(prev => ({
+            ...prev,
+            progress: data.progress ?? prev.progress,
+            rate: data.rate ?? prev.rate,
+            etaSeconds: data.eta_seconds ?? prev.etaSeconds,
+            stats: { ...prev.stats, ...data.stats },
+            lastResult: data.image ?? prev.lastResult,
+          }))
+          appendLog(data.message, data.level)
+          break
+
+        case 'complete':
+          setPipelineState(prev => ({
+            ...prev,
+            isRunning: false,
+            isStopping: false,
+            progress: 100,
+            rate: 0,
+            etaSeconds: null,
+            stats: { ...prev.stats, ...data.stats },
+          }))
+          appendLog(data.message, data.level || 'info')
+          break
+
+        case 'error':
+          setPipelineState(prev => ({ ...prev, isRunning: false, isStopping: false }))
+          appendLog(data.message, 'error')
+          break
+
+        default:
+          break
+      }
+    }
+
+    // EventSource reconnects automatically on drop; the snapshot event on
+    // reconnect resyncs state, so there's nothing extra to do here.
+    source.onerror = () => {}
+
+    return () => source.close()
+  }, [appendLog])
 
   const startPipeline = useCallback(async () => {
-    setPipelineState(prev => ({ ...prev, isRunning: true, progress: 0 }))
+    setPipelineState(prev => ({ ...prev, isRunning: true, progress: 0, rate: 0, etaSeconds: null }))
 
     try {
       const response = await fetch('/api/pipeline/start', {
@@ -103,20 +156,18 @@ export function PipelineProvider({ children }) {
         throw new Error(err.detail || 'Failed to start pipeline')
       }
     } catch (error) {
-      setPipelineState(prev => ({
-        ...prev,
-        isRunning: false,
-        logs: [...prev.logs, { time: new Date().toISOString(), message: error.message, level: 'error' }],
-      }))
+      setPipelineState(prev => ({ ...prev, isRunning: false }))
+      appendLog(error.message, 'error')
     }
-  }, [pipelineState.config])
+  }, [pipelineState.config, appendLog])
 
   const stopPipeline = useCallback(async () => {
+    setPipelineState(prev => ({ ...prev, isStopping: true }))
     try {
       await fetch('/api/pipeline/stop', { method: 'POST' })
-      setPipelineState(prev => ({ ...prev, isRunning: false }))
     } catch (error) {
       console.error('Failed to stop pipeline:', error)
+      setPipelineState(prev => ({ ...prev, isStopping: false }))
     }
   }, [])
 
@@ -147,6 +198,7 @@ export function PipelineProvider({ children }) {
     setFilter,
     selectImage,
     clearLogs,
+    refreshStats: fetchStats,
   }
 
   return (
