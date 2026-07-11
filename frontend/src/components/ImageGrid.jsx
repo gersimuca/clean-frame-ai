@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import ImageCard from './ImageCard'
 import BatchActions from './BatchActions'
+import { fetchImagesForStatus } from '../lib/images'
 
 const STATUS_CONFIG = {
   accepted: { icon: CheckCircle2, color: 'text-emerald-600', bg: 'bg-emerald-50', label: 'Accepted' },
@@ -34,17 +35,17 @@ export default function ImageGrid() {
 
   useEffect(() => {
     fetchImages()
+    setSelectedImages(new Set())
   }, [status])
 
   const fetchImages = async () => {
     setLoading(true)
     try {
-      const endpoint = status === 'invalid' ? '/api/images/invalid' : `/api/images?status=${status}&limit=200`
-      const response = await fetch(endpoint)
-      const data = await response.json()
+      const data = await fetchImagesForStatus(status)
       setImages(data.images || [])
     } catch (error) {
       console.error('Failed to fetch images:', error)
+      setImages([])
     } finally {
       setLoading(false)
     }
@@ -140,7 +141,7 @@ export default function ImageGrid() {
               viewMode={viewMode}
               isSelected={selectedImages.has(image.id)}
               onToggle={() => toggleSelection(image.id)}
-              onClick={() => navigate(`/review/${status}/${image.id}`)}
+              onClick={() => navigate(`/review/${status}/${image.id}`, { state: { ids: filteredImages.map(i => i.id) } })}
             />
           ))}
         </div>

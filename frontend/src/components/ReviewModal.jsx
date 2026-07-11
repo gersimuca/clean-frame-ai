@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useEffect, useState, useCallback } from 'react'
+import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   X,
   ChevronLeft,
@@ -11,17 +11,41 @@ import {
   Info,
   AlertTriangle
 } from 'lucide-react'
+import { fetchImagesForStatus } from '../lib/images'
 
 export default function ReviewModal() {
   const { status, id } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const [image, setImage] = useState(null)
   const [loading, setLoading] = useState(true)
   const [showInfo, setShowInfo] = useState(false)
+  const [siblingIds, setSiblingIds] = useState(location.state?.ids || null)
 
   useEffect(() => {
     fetchImage()
   }, [id])
+
+  // Sibling id list powers prev/next. ImageGrid passes it via router state so
+  // there's no extra round-trip in the common case; if it's missing (direct
+  // link, refresh, or the state got lost on navigation) we fetch it once so
+  // prev/next still work instead of silently doing nothing.
+  useEffect(() => {
+    if (location.state?.ids) {
+      setSiblingIds(location.state.ids)
+      return
+    }
+    let cancelled = false
+    fetchImagesForStatus(status)
+      .then(data => {
+        if (!cancelled) setSiblingIds((data.images || []).map(img => img.id))
+      })
+      .catch(() => {
+        if (!cancelled) setSiblingIds([])
+      })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status])
 
   const fetchImage = async () => {
     setLoading(true)
@@ -35,6 +59,27 @@ export default function ReviewModal() {
       setLoading(false)
     }
   }
+
+  const currentIndex = siblingIds ? siblingIds.findIndex(sid => String(sid) === String(id)) : -1
+  const prevId = currentIndex > 0 ? siblingIds[currentIndex - 1] : null
+  const nextId = siblingIds && currentIndex >= 0 && currentIndex < siblingIds.length - 1
+    ? siblingIds[currentIndex + 1]
+    : null
+
+  const goTo = useCallback((targetId) => {
+    if (targetId == null) return
+    navigate(`/review/${status}/${targetId}`, { state: { ids: siblingIds } })
+  }, [navigate, status, siblingIds])
+
+  useEffect(() => {
+    const handleKeydown = (e) => {
+      if (e.key === 'ArrowLeft') goTo(prevId)
+      else if (e.key === 'ArrowRight') goTo(nextId)
+      else if (e.key === 'Escape') navigate(`/review/${status}`)
+    }
+    window.addEventListener('keydown', handleKeydown)
+    return () => window.removeEventListener('keydown', handleKeydown)
+  }, [goTo, prevId, nextId, navigate, status])
 
   const handleAction = async (action) => {
     try {
@@ -66,6 +111,8 @@ export default function ReviewModal() {
   if (!image) return null
 
   const isInvalid = image.status === 'rejected' || image.status === 'error'
+  const hasScore = typeof image.score === 'number'
+  const hasDetections = Array.isArray(image.detections) && image.detections.length > 0
 
   return (
     <div className="fixed inset-0 bg-black/95 z-50 flex animate-fade-in">
@@ -73,17 +120,25 @@ export default function ReviewModal() {
         <button onClick={() => navigate(`/review/${status}`)} className="absolute top-4 right-4 w-10 h-10 bg-gray-800/80 rounded-full flex items-center justify-center text-white hover:bg-gray-700 transition-colors z-10">
           <X className="w-5 h-5" />
         </button>
-        <button onClick={() => {}} className="absolute left-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-gray-800/80 rounded-full flex items-center justify-center text-white hover:bg-gray-700 transition-colors">
+        <button
+          onClick={() => goTo(prevId)}
+          disabled={!prevId}
+          className="absolute left-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-gray-800/80 rounded-full flex items-center justify-center text-white hover:bg-gray-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-gray-800/80"
+        >
           <ChevronLeft className="w-6 h-6" />
         </button>
-        <button onClick={() => {}} className="absolute right-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-gray-800/80 rounded-full flex items-center justify-center text-white hover:bg-gray-700 transition-colors">
+        <button
+          onClick={() => goTo(nextId)}
+          disabled={!nextId}
+          className="absolute right-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-gray-800/80 rounded-full flex items-center justify-center text-white hover:bg-gray-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-gray-800/80"
+        >
           <ChevronRight className="w-6 h-6" />
         </button>
 
         <img src={image.url} alt={image.filename} className="max-w-full max-h-full object-contain" />
 
-        {image.detections && (
-          <svg className="absolute inset-0 pointer-events-none" viewBox={`0 0 ${image.width || 1000} ${image.height || 1000}`} preserveAspectRatio="none">
+        {hasDetections && (
+          <svg className="absolute inset-0 pointer-events-none" viewBox={`0 0 ${image.width || 1000} ${image.height || 1000}`} preserveAspectRatio="xMidYMid meet">
             {image.detections.map((det, i) => (
               <rect key={i} x={det.x1} y={det.y1} width={det.x2 - det.x1} height={det.y2 - det.y1} fill="none" stroke="#10b981" strokeWidth="3" rx="4" />
             ))}
@@ -103,7 +158,7 @@ export default function ReviewModal() {
             image.status === 'rejected' ? 'bg-red-100 text-red-700' :
             'bg-gray-100 text-gray-700'
           }`}>
-            {image.status.toUpperCase()}
+            {image.status?.toUpperCase()}
           </span>
         </div>
 
@@ -118,7 +173,7 @@ export default function ReviewModal() {
             </div>
           )}
 
-          {image.score !== undefined && (
+          {hasScore && (
             <div>
               <p className="text-sm font-medium text-gray-600 mb-2">Quality Score</p>
               <div className="flex items-center gap-3">
@@ -147,7 +202,7 @@ export default function ReviewModal() {
             )}
           </div>
 
-          {image.detections && (
+          {hasDetections && (
             <div>
               <p className="text-sm font-medium text-gray-600 mb-3">Detected Objects</p>
               <div className="space-y-2">

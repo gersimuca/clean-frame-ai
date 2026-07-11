@@ -1,10 +1,27 @@
 import sqlite3
 import json
+import struct
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import contextmanager
 from config import settings
+
+# Maps the "reason" categories used by the review UI (corrupt / irrelevant /
+# bad-framing) to the DB column that is populated when an image is rejected
+# for that reason. These are NOT values of the `status` column - `status` is
+# only ever 'pending' | 'accepted' | 'rejected' | 'error'. Keeping this as a
+# whitelist dict (rather than interpolating caller input into SQL) is what
+# keeps the f-string in get_by_reason/count_by_reason safe.
+REASON_COLUMNS = {
+    "corrupt": "corrupt_reason",
+    "irrelevant": "relevance_reason",
+    "bad-framing": "framing_reason",
+}
+
+_IMAGE_COLUMNS = """id, filename, file_size_bytes, width, height, status, corrupt_pass, corrupt_reason,
+                    relevance_score, relevance_reason, framing_score, framing_reason, detections,
+                    processed_at, accepted_at"""
 
 
 class Database:
@@ -66,24 +83,46 @@ class Database:
 
     def get_pending(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         with self._connect() as conn:
-            sql = "SELECT id, filename, file_size_bytes, width, height, status, corrupt_pass, corrupt_reason, relevance_score, relevance_reason, framing_score, framing_reason, detections, processed_at, accepted_at FROM images WHERE status = 'pending' ORDER BY id"
+            sql = f"SELECT {_IMAGE_COLUMNS} FROM images WHERE status = 'pending' ORDER BY id"
             if limit:
                 sql += f" LIMIT {limit}"
             rows = conn.execute(sql).fetchall()
-            return [dict(row) for row in rows]
+            return [self._row_to_dict(row) for row in rows]
 
     def get_by_status(self, status: str, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, filename, file_size_bytes, width, height, status, corrupt_pass, corrupt_reason, relevance_score, relevance_reason, framing_score, framing_reason, detections, processed_at, accepted_at FROM images WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                f"SELECT {_IMAGE_COLUMNS} FROM images WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
                 (status, limit, offset)
             ).fetchall()
             return [self._row_to_dict(row) for row in rows]
 
+    def count_by_status(self, status: str) -> int:
+        with self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM images WHERE status = ?", (status,)).fetchone()[0]
+
+    def get_by_reason(self, reason_type: str, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        column = REASON_COLUMNS.get(reason_type)
+        if not column:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_IMAGE_COLUMNS} FROM images WHERE {column} IS NOT NULL ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [self._row_to_dict(row) for row in rows]
+
+    def count_by_reason(self, reason_type: str) -> int:
+        column = REASON_COLUMNS.get(reason_type)
+        if not column:
+            return 0
+        with self._connect() as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM images WHERE {column} IS NOT NULL").fetchone()[0]
+
     def get_all_invalid(self) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT id, filename, file_size_bytes, width, height, status, corrupt_pass, corrupt_reason, relevance_score, relevance_reason, framing_score, framing_reason, detections, processed_at, accepted_at 
+                f"""SELECT {_IMAGE_COLUMNS}
                    FROM images 
                    WHERE status IN ('rejected', 'error') 
                    ORDER BY id DESC"""
@@ -93,7 +132,7 @@ class Database:
     def get_by_id(self, image_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, filename, file_size_bytes, width, height, status, corrupt_pass, corrupt_reason, relevance_score, relevance_reason, framing_score, framing_reason, detections, processed_at, accepted_at FROM images WHERE id = ?",
+                f"SELECT {_IMAGE_COLUMNS} FROM images WHERE id = ?",
                 (image_id,)
             ).fetchone()
             return self._row_to_dict(row) if row else None
@@ -105,6 +144,17 @@ class Database:
         for key, val in kwargs.items():
             if key == "detections":
                 val = json.dumps(val) if val else None
+            elif hasattr(val, "item") and not isinstance(val, (bytes, bytearray, memoryview)):
+                # Catches numpy/torch scalar types (e.g. numpy.float32).
+                # sqlite3 accepts these as bind parameters without error via
+                # the buffer protocol and silently stores them as raw BLOB
+                # bytes instead of the number they represent - the same bug
+                # that corrupted framing_score. `.item()` unwraps them to a
+                # native Python int/float that sqlite3 stores correctly.
+                try:
+                    val = val.item()
+                except (ValueError, TypeError):
+                    pass
             fields.append(f"{key} = ?")
             values.append(val)
 
@@ -159,6 +209,10 @@ class Database:
                 (image_id,),
             )
 
+    def delete_image(self, image_id: int):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+
     def clear_all(self):
         with self._connect() as conn:
             conn.execute("DELETE FROM images")
@@ -166,8 +220,34 @@ class Database:
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
         if d.get("detections"):
-            d["detections"] = json.loads(d["detections"])
+            try:
+                d["detections"] = json.loads(d["detections"])
+            except (json.JSONDecodeError, TypeError):
+                d["detections"] = None
+        for key in ("relevance_score", "framing_score"):
+            d[key] = _recover_real_from_blob(d.get(key))
         return d
+
+
+def _recover_real_from_blob(value):
+    """Best-effort recovery for a REAL column that was previously corrupted
+    into raw BLOB bytes by the numpy-scalar bug (see framing_filter.py /
+    update_status). A numpy.float32/float64 passed straight to sqlite3 gets
+    silently stored as its raw little-endian byte representation instead of
+    raising an error, so existing databases can have real, recoverable
+    scores sitting behind a `bytes` value. If we can unpack it back to a
+    float, return that; otherwise fall back to None rather than letting a
+    raw bytes object reach the API and crash JSON serialization."""
+    if not isinstance(value, (bytes, bytearray)):
+        return value
+    try:
+        if len(value) == 4:
+            return struct.unpack("<f", value)[0]
+        if len(value) == 8:
+            return struct.unpack("<d", value)[0]
+    except struct.error:
+        pass
+    return None
 
 
 db = Database(settings.db_path)
